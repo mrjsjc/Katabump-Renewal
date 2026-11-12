@@ -2,12 +2,16 @@ name: Katabump Auto Renew
 
 on:
   schedule:
-    # 每天 UTC 0 点（北京时间 8 点）
-    - cron: "0 0 * * *"
+    # 每天两次（UTC 01:17 / 13:23）—— 避开整点的 GitHub 调度拥塞，
+    # 免费机只能"到期前 2 天"续期，多跑几次能覆盖所有窗口。
+    - cron: "17 1 * * *"
+    - cron: "23 13 * * *"
   workflow_dispatch:
 
+# 防止 60 天无提交后 GitHub 自动停掉 schedule：
+# 这个 job 每次运行都会往 keepalive 分支提交一次时间戳。
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   renew:
@@ -134,4 +138,24 @@ jobs:
             screenshots/
             singbox.log
             config.json
+            renew.log
           if-no-files-found: ignore
+
+      - name: Keep schedule alive
+        if: always()
+        continue-on-error: true
+        run: |
+          # GitHub 会在仓库连续 60 天无推送后停掉 schedule。
+          # 这里把运行时间戳推到一个独立分支，保证主分支历史干净。
+          # （2026-11 就是因为 8-27 之后无提交，schedule 在 11-06 后失效，
+          #   错过了 11-09 唯一的续期窗口，导致服务器被删。）
+          stamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin keepalive --depth=1 2>/dev/null || true
+          git checkout -B keepalive FETCH_HEAD 2>/dev/null || git checkout --orphan keepalive
+          git rm -rf . --quiet 2>/dev/null || true
+          echo "$stamp" > .keepalive
+          git add .keepalive
+          git commit -m "keepalive: $stamp" --quiet || echo "no changes"
+          git push origin keepalive --force --quiet || echo "::warning::keepalive push failed"
