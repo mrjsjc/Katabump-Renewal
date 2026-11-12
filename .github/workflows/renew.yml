@@ -67,15 +67,62 @@ jobs:
           fi
 
       - name: Run Renew Script
+        id: renew
         env:
           USERS_JSON: ${{ secrets.USERS_JSON }}
           KATABUMP_EMAIL: ${{ secrets.KATABUMP_EMAIL }}
+          # 注意：这是 dashboard **账户密码**，不是服务器/SFTP 密码
           KATABUMP_PASSWORD: ${{ secrets.KATABUMP_PASSWORD }}
           PROXY_SERVER: http://127.0.0.1:8080
           IS_PROXY: ${{ secrets.PROXY_URL != '' && 'true' || 'false' }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 main.py
+        run: |
+          set -o pipefail
+          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python3 main.py 2>&1 | tee renew.log
+          status=${PIPESTATUS[0]}
+          echo "exit_code=$status" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      - name: Assert renew succeeded
+        if: always()
+        run: |
+          # 硬断言：以下任一情况都把 job 判为失败，绝不允许"绿色但没续"
+          fail=0
+
+          if [ "${{ steps.renew.outputs.exit_code }}" != "0" ]; then
+            echo "::error::续费脚本退出码 = ${{ steps.renew.outputs.exit_code }}"
+            fail=1
+          fi
+
+          if [ ! -f renew.log ]; then
+            echo "::error::没有产生 renew.log"
+            fail=1
+          fi
+
+          # 登录必须成功（main.py 已改为登录失败时 raise）
+          if grep -qE "登录失败|登录被拒绝|login (failed|rejected)" renew.log 2>/dev/null; then
+            echo "::error::日志显示登录失败"
+            grep -nE "登录失败|登录被拒绝|login (failed|rejected)" renew.log | head -5
+            fail=1
+          fi
+
+          # captcha 类错误
+          if grep -qE "error=captcha" renew.log 2>/dev/null; then
+            echo "::error::登录被 Cloudflare CAPTCHA 拒绝（Turnstile 未通过）"
+            fail=1
+          fi
+
+          # 至少要有一次"续期成功"或明确的"未到续期时间"
+          if ! grep -qE "续期成功|renewed|未到续期时间|can't renew|already" renew.log 2>/dev/null; then
+            echo "::warning::日志里没有找到明确的续期结论（可能所有服务器都无需续期）"
+          fi
+
+          if [ "$fail" != "0" ]; then
+            echo "::error::断言失败 —— 本次续费未成功，请查看 artifacts"
+            exit 1
+          fi
+          echo "✅ 断言通过"
 
       - name: Upload Artifacts
         if: always()

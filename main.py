@@ -259,6 +259,34 @@ def _switch_to_turnstile_frame(sb):
         return False
 
 def handle_turnstile(sb) -> bool:
+    """处理 Cloudflare Turnstile。
+
+    实测：某些环境下 iframe 不会被渲染（div 有尺寸但内部无 iframe），
+    此时任何基于 iframe 的检测都会失败。兜底方案是在 div 坐标上真实点击，
+    让浏览器以「真人」方式触发挑战。
+    """
+    # ===== 兜底：先尝试用坐标真实点击 =====
+    try:
+        rect = sb.driver.execute_script("""
+        (function(){
+            var d = document.querySelector('.cf-turnstile');
+            if (!d) return null;
+            var r = d.getBoundingClientRect();
+            return {x: Math.round(r.left + r.width/2), y: Math.round(r.top + r.height/2),
+                    w: Math.round(r.width), h: Math.round(r.height)};
+        })()
+        """)
+        if rect and rect.get("w", 0) > 20:
+            print(f"🎯 Turnstile 容器坐标 {rect['x']},{rect['y']} —— 用 xdotool 真实点击")
+            _xdotool_click(rect["x"], rect["y"])
+            time.sleep(3)
+            if sb.execute_script(_SOLVED_JS):
+                print("✅ 坐标点击后 Turnstile 已通过")
+                return True
+    except Exception as e:
+        print(f"   坐标点击异常: {type(e).__name__}")
+
+
     print("🔍 处理 Cloudflare Turnstile 验证...")
     time.sleep(2)
     if sb.execute_script(_SOLVED_JS):
@@ -437,14 +465,34 @@ def login(sb, email, password) -> bool:
         page_title = sb.get_title() or ""
         if cur_url.startswith(f"{BASE_URL}/dashboard") or "dashboard | katabump" in page_title.lower():
             break
-    cur_url = sb.get_current_url().split('?')[0].lower()
+    # ===== 修复：登录结果必须严格判定 =====
+    # 原实现漏了 ?error=captcha —— 被 Cloudflare 拒绝时 URL 仍是 /auth/login，
+    # 但某些分支会让函数返回 True，导致 Actions 绿色而实际没登录。
+    cur_url = sb.get_current_url()
     page_title = sb.get_title() or ""
-    if cur_url.startswith(f"{BASE_URL}/dashboard") or "dashboard | katabump" in page_title.lower():
-        print(f"✅ 登录成功！(URL: {sb.get_current_url()}, Title: {page_title})")
-        return True
-    print(f"❌ 登录失败，页面未跳转到账户页。(URL: {sb.get_current_url()}, Title: {page_title})")
-    sb.save_screenshot("login_failed.png")
-    return False
+    base_url = cur_url.split("?")[0].lower()
+    query = cur_url.split("?", 1)[1].lower() if "?" in cur_url else ""
+
+    if "error=" in query:
+        # captcha / credentials 等任何 error 参数都算失败
+        err = ""
+        for kv in query.split("&"):
+            if kv.startswith("error="):
+                err = kv.split("=", 1)[1]
+                break
+        print(f"❌ 登录被拒绝：error={err}  URL={cur_url}")
+        sb.save_screenshot("login_failed.png")
+        raise RuntimeError(f"login rejected by server: error={err}")
+
+    ok = base_url.startswith(f"{BASE_URL}/dashboard".lower()) \
+        or "dashboard | katabump" in page_title.lower()
+    if not ok:
+        print(f"❌ 登录失败：未跳转到 dashboard  URL={cur_url}  Title={page_title}")
+        sb.save_screenshot("login_failed.png")
+        raise RuntimeError(f"login failed: url={cur_url} title={page_title}")
+
+    print(f"✅ 登录成功：URL={cur_url}  Title={page_title}")
+    return True
 
 def _read_alert(sb):
     try:
